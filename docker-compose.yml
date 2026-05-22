@@ -1,13 +1,62 @@
 services:
   kiro-rs:
-    # 使用国内镜像
+    build: .
+    # Use a prebuilt image instead of local build if needed:
     # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
-    image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+    image: kiro-rs:local
     container_name: kiro-rs
+    environment:
+      APP_API_KEY: ${APP_API_KEY:-sk-kiro-rs-qazWSXedcRFV123456}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-sk-admin-your-secret-key}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "8990:8990"
     volumes:
       - ./config/:/app/config/
+    command:
+      - sh
+      - -c
+      - |
+        cat > /app/config/config.json <<EOF
+        {
+          "host": "0.0.0.0",
+          "port": 8990,
+          "region": "us-east-1",
+          "kiroVersion": "0.11.107",
+          "machineId": null,
+          "apiKey": "$${APP_API_KEY}",
+          "systemVersion": "darwin#24.6.0",
+          "nodeVersion": "22.22.0",
+          "tlsBackend": "rustls",
+          "countTokensApiUrl": null,
+          "countTokensApiKey": null,
+          "countTokensAuthType": "x-api-key",
+          "proxyUrl": null,
+          "proxyUsername": null,
+          "proxyPassword": null,
+          "adminApiKey": "$${ADMIN_API_KEY}",
+          "loadBalancingMode": "balanced",
+          "extractThinking": true,
+          "defaultEndpoint": "ide",
+          "endpoints": {}
+        }
+        EOF
+        if [ ! -f /app/config/credentials.json ]; then
+          cat > /app/config/credentials.json <<EOF
+        [
+          {
+            "id": 1,
+            "authMethod": "api_key",
+            "kiroApiKey": "ksk_fake_credential_for_local_ui_testing_only",
+            "email": "fake@example.local",
+            "subscriptionTitle": "FAKE TEST CREDENTIAL",
+            "priority": 0,
+            "disabled": true,
+            "endpoint": "ide"
+          }
+        ]
+        EOF
+        fi
+        exec ./kiro-rs -c /app/config/config.json --credentials /app/config/credentials.json
     restart: unless-stopped
