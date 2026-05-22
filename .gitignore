@@ -3,7 +3,9 @@
 /AGENTS.md
 /config.json
 /credentials.json
-/config/*.json
+/config/config.json
+/config/kiro_balance_cache.json
+/config/kiro_stats.json
 /.idea
 /test.json
 /admin-ui/node_modules/
