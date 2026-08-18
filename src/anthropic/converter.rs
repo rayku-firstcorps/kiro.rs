@@ -940,6 +940,35 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_control_fields_are_accepted() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 128,
+            "system": [{
+                "type": "text",
+                "text": "stable system instructions",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "request-specific input",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .expect("Anthropic cache_control fields should be accepted");
+
+        let result = convert_request(&request).expect("cache_control must not block conversion");
+        assert!(result
+            .conversation_state
+            .history
+            .iter()
+            .any(|message| matches!(message, Message::User(_))));
+    }
+
+    #[test]
     fn test_map_model_thinking_suffix_sonnet() {
         // thinking 后缀不应影响 sonnet 模型映射
         let result = map_model("claude-sonnet-4-5-20250929-thinking");
@@ -1140,6 +1169,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                cache_control: None,
             }]),
             thinking: None,
             tool_choice: None,
@@ -1203,6 +1233,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                cache_control: None,
             }]),
             thinking: None,
             tool_choice: None,

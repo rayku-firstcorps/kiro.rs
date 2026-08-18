@@ -8,6 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+use super::cache::CacheUsage;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -291,6 +292,7 @@ pub struct SseStateManager {
     stop_reason: Option<String>,
     /// 是否有工具调用
     has_tool_use: bool,
+    cache_usage: CacheUsage,
 }
 
 impl Default for SseStateManager {
@@ -309,6 +311,7 @@ impl SseStateManager {
             next_block_index: 0,
             stop_reason: None,
             has_tool_use: false,
+            cache_usage: CacheUsage::default(),
         }
     }
 
@@ -329,6 +332,10 @@ impl SseStateManager {
     /// 记录工具调用
     pub fn set_has_tool_use(&mut self, has: bool) {
         self.has_tool_use = has;
+    }
+
+    pub fn set_cache_usage(&mut self, usage: CacheUsage) {
+        self.cache_usage = usage;
     }
 
     /// 设置 stop_reason
@@ -488,7 +495,13 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
+                        "output_tokens": output_tokens,
+                        "cache_creation_input_tokens": self.cache_usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": self.cache_usage.cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": self.cache_usage.cache_creation_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": self.cache_usage.cache_creation_1h_input_tokens
+                        }
                     }
                 }),
             ));
@@ -542,15 +555,33 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    cache_usage: CacheUsage,
 }
 
 impl StreamContext {
     /// 创建启用thinking的StreamContext
+    #[cfg(test)]
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        Self::new_with_thinking_and_cache(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            CacheUsage::default(),
+        )
+    }
+
+    pub fn new_with_thinking_and_cache(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        cache_usage: CacheUsage,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -568,11 +599,14 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            cache_usage,
         }
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let cache_usage = self.cache_usage.bounded(self.input_tokens);
+        let uncached_input_tokens = cache_usage.uncached_input_tokens(self.input_tokens);
         json!({
             "type": "message_start",
             "message": {
@@ -584,8 +618,14 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
+                    "input_tokens": uncached_input_tokens,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_usage.cache_read_input_tokens,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                        "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                    }
                 }
             }
         })
@@ -1119,11 +1159,14 @@ impl StreamContext {
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let cache_usage = self.cache_usage.bounded(final_input_tokens);
+        let uncached_input_tokens = cache_usage.uncached_input_tokens(final_input_tokens);
 
+        self.state_manager.set_cache_usage(cache_usage);
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events(uncached_input_tokens, self.output_tokens),
         );
         events
     }
@@ -1151,15 +1194,20 @@ pub struct BufferedStreamContext {
 }
 
 impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
+    pub fn new_with_cache(
         model: impl Into<String>,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        cache_usage: CacheUsage,
     ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+        let inner = StreamContext::new_with_thinking_and_cache(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            cache_usage,
+        );
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1207,13 +1255,23 @@ impl BufferedStreamContext {
             .inner
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
+        let cache_usage = self.inner.cache_usage.bounded(final_input_tokens);
+        let uncached_input_tokens = cache_usage.uncached_input_tokens(final_input_tokens);
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(uncached_input_tokens);
+                        usage["cache_creation_input_tokens"] =
+                            serde_json::json!(cache_usage.cache_creation_input_tokens);
+                        usage["cache_read_input_tokens"] =
+                            serde_json::json!(cache_usage.cache_read_input_tokens);
+                        usage["cache_creation"] = serde_json::json!({
+                            "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                        });
                     }
                 }
             }
@@ -1269,6 +1327,39 @@ mod tests {
         // 第二次应该被跳过
         let event = manager.handle_message_start(json!({"type": "message_start"}));
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_message_start_includes_zero_prompt_cache_usage() {
+        let ctx = StreamContext::new_with_thinking("claude-sonnet-4.5", 12, false, HashMap::new());
+        let usage = ctx.create_message_start_event()["message"]["usage"].clone();
+
+        assert_eq!(usage["input_tokens"], 12);
+        assert_eq!(usage["output_tokens"], 1);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 0);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+    }
+
+    #[test]
+    fn test_message_start_separates_cached_from_uncached_input() {
+        let ctx = StreamContext::new_with_thinking_and_cache(
+            "claude-sonnet-4.5",
+            100,
+            false,
+            HashMap::new(),
+            CacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 80,
+                ..CacheUsage::default()
+            },
+        );
+        let usage = ctx.create_message_start_event()["message"]["usage"].clone();
+
+        assert_eq!(usage["input_tokens"], 20);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 80);
     }
 
     #[test]

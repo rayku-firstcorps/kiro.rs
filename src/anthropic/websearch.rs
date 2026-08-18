@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::cache::CacheUsage;
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
@@ -220,9 +221,16 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_usage: CacheUsage,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        cache_usage,
+    );
 
     stream::iter(
         events
@@ -238,8 +246,11 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_usage: CacheUsage,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
+    let cache_usage = cache_usage.bounded(input_tokens);
+    let uncached_input_tokens = cache_usage.uncached_input_tokens(input_tokens);
     let message_id = format!(
         "msg_{}",
         Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
@@ -258,10 +269,14 @@ fn generate_websearch_events(
                 "content": [],
                 "stop_reason": null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": uncached_input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_usage.cache_read_input_tokens,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                        "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                    }
                 }
             }
         }),
@@ -426,6 +441,12 @@ fn generate_websearch_events(
             },
             "usage": {
                 "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": cache_usage.cache_read_input_tokens,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                    "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                },
                 "server_tool_use": {
                     "web_search_requests": 1
                 }
@@ -475,6 +496,7 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    cache_usage: CacheUsage,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -507,8 +529,14 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        cache_usage,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
@@ -569,6 +597,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -599,6 +628,7 @@ mod tests {
                     description: String::new(),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    cache_control: None,
                 },
                 Tool {
                     tool_type: None,
@@ -606,6 +636,7 @@ mod tests {
                     description: "Other tool".to_string(),
                     input_schema: Default::default(),
                     max_uses: None,
+                    cache_control: None,
                 },
             ]),
             tool_choice: None,

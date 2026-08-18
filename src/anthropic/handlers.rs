@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
+use super::cache::{self, CacheUsage};
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -276,6 +277,7 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    let cache_usage = cache::record_request(&payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -289,7 +291,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_usage).await;
     }
 
     // 转换请求
@@ -362,12 +364,13 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_usage,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_usage).await
     }
 }
 
@@ -379,6 +382,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_usage: CacheUsage,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -387,7 +391,13 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_thinking_and_cache(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        cache_usage,
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -515,6 +525,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_usage: CacheUsage,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -673,6 +684,8 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    let cache_usage = cache_usage.bounded(final_input_tokens);
+    let uncached_input_tokens = cache_usage.uncached_input_tokens(final_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -684,8 +697,14 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "input_tokens": uncached_input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_usage.cache_read_input_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+            }
         }
     });
 
@@ -791,6 +810,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    let cache_usage = cache::record_request(&payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -804,7 +824,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_usage).await;
     }
 
     // 转换请求
@@ -877,12 +897,13 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_usage,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_usage).await
     }
 }
 
@@ -897,6 +918,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_usage: CacheUsage,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -905,7 +927,13 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new_with_cache(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        cache_usage,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
