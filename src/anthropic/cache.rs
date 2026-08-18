@@ -91,45 +91,68 @@ impl CacheUsage {
 struct CacheEntry {
     expires_at: Instant,
     input_tokens: i32,
+    ttl: Duration,
+}
+
+#[derive(Debug)]
+struct Prefix {
+    key: String,
+    input_tokens: i32,
+}
+
+#[derive(Debug)]
+struct CacheRequest {
+    prefixes: Vec<Prefix>,
+    breakpoints: Vec<(usize, Duration)>,
 }
 
 static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
 
 /// Record Anthropic cache breakpoints in a request.
 pub fn record_request(req: &MessagesRequest) -> CacheUsage {
-    let candidates = cache_prefixes(req);
-    if candidates.is_empty() {
+    let cache_request = cache_request(req);
+    if cache_request.breakpoints.is_empty() {
         return CacheUsage::default();
     }
-    let candidates: Vec<_> = candidates
-        .into_iter()
-        .map(|(prefix, ttl, input_tokens)| {
-            let prefix_json = serde_json::to_vec(&prefix).unwrap_or_default();
-            let mut hasher = Sha256::new();
-            hasher.update(req.model.as_bytes());
-            hasher.update([0]);
-            hasher.update(&prefix_json);
-            (format!("{:x}", hasher.finalize()), ttl, input_tokens)
-        })
-        .collect();
 
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let now = Instant::now();
     let mut entries = cache.lock().expect("prompt cache lock poisoned");
     entries.retain(|_, entry| entry.expires_at > now);
 
-    let cache_read_input_tokens = candidates
+    // A cache marker commonly moves to the newest message on every turn. Search
+    // every earlier boundary beneath the current markers so a previously cached
+    // shorter prefix can still be reused.
+    let matched_key = cache_request
+        .breakpoints
         .iter()
-        .rev()
-        .find_map(|(key, _, _)| entries.get(key).map(|entry| entry.input_tokens))
+        .filter_map(|(breakpoint_index, _)| {
+            cache_request.prefixes[..=*breakpoint_index]
+                .iter()
+                .rev()
+                .find(|prefix| entries.contains_key(&prefix.key))
+        })
+        .max_by_key(|prefix| prefix.input_tokens)
+        .map(|prefix| prefix.key.clone());
+    let cache_read_input_tokens = matched_key
+        .as_ref()
+        .and_then(|key| entries.get(key))
+        .map(|entry| entry.input_tokens)
         .unwrap_or(0);
+    if let Some(key) = matched_key
+        && let Some(entry) = entries.get_mut(&key)
+    {
+        entry.expires_at = now + entry.ttl;
+    }
+
     let mut accounted_input_tokens = cache_read_input_tokens;
     let mut cache_creation_5m_input_tokens = 0_i32;
     let mut cache_creation_1h_input_tokens = 0_i32;
 
-    for (key, ttl, input_tokens) in candidates {
-        if !entries.contains_key(&key) && input_tokens > accounted_input_tokens {
-            let created = input_tokens.saturating_sub(accounted_input_tokens);
+    for (breakpoint_index, ttl) in cache_request.breakpoints {
+        let prefix = &cache_request.prefixes[breakpoint_index];
+        if !entries.contains_key(&prefix.key) && prefix.input_tokens > accounted_input_tokens {
+            let created = prefix.input_tokens.saturating_sub(accounted_input_tokens);
             if ttl >= Duration::from_secs(60 * 60) {
                 cache_creation_1h_input_tokens =
                     cache_creation_1h_input_tokens.saturating_add(created);
@@ -137,12 +160,16 @@ pub fn record_request(req: &MessagesRequest) -> CacheUsage {
                 cache_creation_5m_input_tokens =
                     cache_creation_5m_input_tokens.saturating_add(created);
             }
-            accounted_input_tokens = input_tokens;
+            accounted_input_tokens = prefix.input_tokens;
         }
-        entries.entry(key).or_insert(CacheEntry {
-            expires_at: now + ttl,
-            input_tokens,
-        });
+        entries
+            .entry(prefix.key.clone())
+            .and_modify(|entry| entry.expires_at = now + entry.ttl)
+            .or_insert(CacheEntry {
+                expires_at: now + ttl,
+                input_tokens: prefix.input_tokens,
+                ttl,
+            });
     }
     let cache_creation_input_tokens =
         cache_creation_5m_input_tokens.saturating_add(cache_creation_1h_input_tokens);
@@ -159,8 +186,9 @@ pub fn record_request(req: &MessagesRequest) -> CacheUsage {
     }
 }
 
-/// Return every request prefix ending at an Anthropic cache breakpoint.
-fn cache_prefixes(req: &MessagesRequest) -> Vec<(Vec<Value>, Duration, i32)> {
+/// Build deterministic hashes for every request boundary and record which of
+/// those boundaries contain Anthropic cache markers.
+fn cache_request(req: &MessagesRequest) -> CacheRequest {
     let mut segments = Vec::new();
     let mut token_counts = Vec::new();
     let mut breakpoints: Vec<(usize, Duration)> = Vec::new();
@@ -177,8 +205,15 @@ fn cache_prefixes(req: &MessagesRequest) -> Vec<(Vec<Value>, Duration, i32)> {
 
     if let Some(tools) = &req.tools {
         for tool in tools {
-            segments.push(json!({"role": "tool", "tool": tool}));
-            let schema = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+            let tool_value = serde_json::to_value(tool).unwrap_or(Value::Null);
+            segments.push(json!({
+                "role": "tool",
+                "tool": content_without_cache_control(tool_value)
+            }));
+            let schema = serde_json::to_string(&canonicalize_json(
+                serde_json::to_value(&tool.input_schema).unwrap_or(Value::Null),
+            ))
+            .unwrap_or_default();
             token_counts.push(
                 count_text(&tool.name)
                     .saturating_add(count_text(&tool.description))
@@ -198,7 +233,10 @@ fn cache_prefixes(req: &MessagesRequest) -> Vec<(Vec<Value>, Duration, i32)> {
             }
             Value::Array(blocks) => {
                 for block in blocks {
-                    segments.push(json!({"role": message.role, "content": block}));
+                    segments.push(json!({
+                        "role": message.role,
+                        "content": content_without_cache_control(block.clone())
+                    }));
                     token_counts.push(content_block_tokens(block));
                     if let Ok(block) = serde_json::from_value::<ContentBlock>(block.clone())
                         && let Some(control) = block.cache_control
@@ -214,17 +252,54 @@ fn cache_prefixes(req: &MessagesRequest) -> Vec<(Vec<Value>, Duration, i32)> {
         }
     }
 
-    breakpoints
+    let mut hasher = Sha256::new();
+    hasher.update((req.model.len() as u64).to_be_bytes());
+    hasher.update(req.model.as_bytes());
+    let mut input_tokens = 0_i32;
+    let prefixes = segments
         .into_iter()
-        .map(|(index, ttl)| {
-            let input_tokens = token_counts[..=index]
-                .iter()
-                .copied()
-                .fold(0_i32, i32::saturating_add)
-                .max(1);
-            (segments[..=index].to_vec(), ttl, input_tokens)
+        .zip(token_counts)
+        .map(|(segment, segment_tokens)| {
+            let segment = canonicalize_json(segment);
+            let bytes = serde_json::to_vec(&segment).unwrap_or_default();
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+            input_tokens = input_tokens.saturating_add(segment_tokens);
+            Prefix {
+                key: format!("{:x}", hasher.clone().finalize()),
+                input_tokens: input_tokens.max(1),
+            }
         })
-        .collect()
+        .collect();
+
+    CacheRequest {
+        prefixes,
+        breakpoints,
+    }
+}
+
+fn content_without_cache_control(mut value: Value) -> Value {
+    if let Value::Object(fields) = &mut value {
+        fields.remove("cache_control");
+    }
+    canonicalize_json(value)
+}
+
+fn canonicalize_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
+        Value::Object(fields) => {
+            let mut fields: Vec<_> = fields.into_iter().collect();
+            fields.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize_json(value)))
+                    .collect(),
+            )
+        }
+        scalar => scalar,
+    }
 }
 
 fn count_text(text: &str) -> i32 {
@@ -341,6 +416,165 @@ mod tests {
             second.cache_read_input_tokens,
             first.cache_creation_input_tokens
         );
+    }
+
+    #[test]
+    fn moving_breakpoint_to_new_message_reuses_previous_prefix() {
+        let first_request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "unique first turn for moving breakpoint",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let first = record_request(&first_request);
+
+        let second_request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 32,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "unique first turn for moving breakpoint"
+                    }]
+                },
+                {"role": "assistant", "content": "first response"},
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "unique second turn for moving breakpoint",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+        let second = record_request(&second_request);
+
+        assert!(first.cache_creation_input_tokens > 0);
+        assert_eq!(
+            second.cache_read_input_tokens,
+            first.cache_creation_input_tokens
+        );
+        assert!(second.cache_creation_input_tokens > 0);
+
+        let billed = second.high_cache(100);
+        assert_eq!(billed.uncached_input_tokens(100), 1);
+        assert_eq!(
+            billed.cache_read_input_tokens + billed.cache_creation_input_tokens,
+            99
+        );
+        assert!(billed.cache_read_input_tokens > billed.cache_creation_input_tokens);
+    }
+
+    #[test]
+    fn cache_control_metadata_does_not_change_prefix_key() {
+        let with_control: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "same semantic cache content",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let without_control: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "text": "same semantic cache content",
+                    "type": "text"
+                }]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cache_request(&with_control).prefixes[0].key,
+            cache_request(&without_control).prefixes[0].key
+        );
+    }
+
+    #[test]
+    fn canonical_tool_schema_has_stable_prefix_key() {
+        let first: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 32,
+            "tools": [{
+                "name": "unique_schema_tool",
+                "description": "schema ordering test",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "alpha": {"type": "string", "description": "first"},
+                        "beta": {"description": "second", "type": "number"}
+                    }
+                },
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let second: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 32,
+            "tools": [{
+                "description": "schema ordering test",
+                "name": "unique_schema_tool",
+                "input_schema": {
+                    "properties": {
+                        "beta": {"type": "number", "description": "second"},
+                        "alpha": {"description": "first", "type": "string"}
+                    },
+                    "type": "object"
+                },
+                "cache_control": {"ttl": "5m", "type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cache_request(&first).prefixes[0].key,
+            cache_request(&second).prefixes[0].key
+        );
+    }
+
+    #[test]
+    fn cache_hit_refreshes_ttl() {
+        let mut req = request(Some("5m"));
+        req.system.as_mut().unwrap()[0].text = "unique ttl refresh prefix".to_string();
+        record_request(&req);
+        let key = cache_request(&req).prefixes[0].key.clone();
+        let cache = CACHE.get().unwrap();
+        {
+            let mut entries = cache.lock().unwrap();
+            entries.get_mut(&key).unwrap().expires_at = Instant::now() + Duration::from_secs(1);
+        }
+
+        let usage = record_request(&req);
+        let entries = cache.lock().unwrap();
+        let remaining = entries[&key]
+            .expires_at
+            .saturating_duration_since(Instant::now());
+
+        assert!(usage.cache_read_input_tokens > 0);
+        assert!(remaining > Duration::from_secs(4 * 60));
     }
 
     #[test]
