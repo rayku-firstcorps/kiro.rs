@@ -684,7 +684,7 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
-    let cache_usage = cache_usage.bounded(final_input_tokens);
+    let cache_usage = cache_usage.high_cache(final_input_tokens);
     let uncached_input_tokens = cache_usage.uncached_input_tokens(final_input_tokens);
 
     // 构建 Anthropic 响应

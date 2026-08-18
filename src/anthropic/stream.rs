@@ -605,7 +605,7 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let cache_usage = self.cache_usage.bounded(self.input_tokens);
+        let cache_usage = self.cache_usage.high_cache(self.input_tokens);
         let uncached_input_tokens = cache_usage.uncached_input_tokens(self.input_tokens);
         json!({
             "type": "message_start",
@@ -1159,7 +1159,7 @@ impl StreamContext {
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
-        let cache_usage = self.cache_usage.bounded(final_input_tokens);
+        let cache_usage = self.cache_usage.high_cache(final_input_tokens);
         let uncached_input_tokens = cache_usage.uncached_input_tokens(final_input_tokens);
 
         self.state_manager.set_cache_usage(cache_usage);
@@ -1255,7 +1255,7 @@ impl BufferedStreamContext {
             .inner
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
-        let cache_usage = self.inner.cache_usage.bounded(final_input_tokens);
+        let cache_usage = self.inner.cache_usage.high_cache(final_input_tokens);
         let uncached_input_tokens = cache_usage.uncached_input_tokens(final_input_tokens);
 
         // 更正 message_start 事件中的 input_tokens
@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_start_separates_cached_from_uncached_input() {
+    fn test_message_start_keeps_one_input_token_on_cache_hit() {
         let ctx = StreamContext::new_with_thinking_and_cache(
             "claude-sonnet-4.5",
             100,
@@ -1357,9 +1357,9 @@ mod tests {
         );
         let usage = ctx.create_message_start_event()["message"]["usage"].clone();
 
-        assert_eq!(usage["input_tokens"], 20);
+        assert_eq!(usage["input_tokens"], 1);
         assert_eq!(usage["cache_creation_input_tokens"], 0);
-        assert_eq!(usage["cache_read_input_tokens"], 80);
+        assert_eq!(usage["cache_read_input_tokens"], 99);
     }
 
     #[test]

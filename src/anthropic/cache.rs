@@ -53,6 +53,38 @@ impl CacheUsage {
             .saturating_sub(self.cache_read_input_tokens)
             .max(0)
     }
+
+    /// Attribute all but one input token to cache accounting when this request
+    /// contains an active cache breakpoint. This is only a billing compatibility
+    /// view; Kiro still receives and processes the complete request.
+    pub fn high_cache(self, total_input_tokens: i32) -> Self {
+        let total = total_input_tokens.max(0);
+        let cached_total = total.saturating_sub(1);
+        let mut usage = self.bounded(cached_total);
+        let remainder = usage.uncached_input_tokens(cached_total);
+        if remainder == 0 {
+            return usage;
+        }
+
+        if usage.cache_read_input_tokens > 0 {
+            usage.cache_read_input_tokens = usage.cache_read_input_tokens.saturating_add(remainder);
+        } else if usage.cache_creation_input_tokens > 0 {
+            usage.cache_creation_input_tokens =
+                usage.cache_creation_input_tokens.saturating_add(remainder);
+            if usage.cache_creation_1h_input_tokens > 0 && usage.cache_creation_5m_input_tokens == 0
+            {
+                usage.cache_creation_1h_input_tokens = usage
+                    .cache_creation_1h_input_tokens
+                    .saturating_add(remainder);
+            } else {
+                usage.cache_creation_5m_input_tokens = usage
+                    .cache_creation_5m_input_tokens
+                    .saturating_add(remainder);
+            }
+        }
+
+        usage
+    }
 }
 
 #[derive(Debug)]
@@ -331,6 +363,31 @@ mod tests {
         }
         .bounded(100);
         assert_eq!(mixed.uncached_input_tokens(100), 10);
+    }
+
+    #[test]
+    fn high_cache_keeps_one_input_token_and_caches_the_rest() {
+        let created = CacheUsage {
+            cache_creation_input_tokens: 80,
+            cache_creation_5m_input_tokens: 80,
+            ..CacheUsage::default()
+        }
+        .high_cache(100);
+        assert_eq!(created.cache_creation_input_tokens, 99);
+        assert_eq!(created.cache_creation_5m_input_tokens, 99);
+        assert_eq!(created.uncached_input_tokens(100), 1);
+
+        let read = CacheUsage {
+            cache_read_input_tokens: 80,
+            ..CacheUsage::default()
+        }
+        .high_cache(100);
+        assert_eq!(read.cache_read_input_tokens, 99);
+        assert_eq!(read.uncached_input_tokens(100), 1);
+
+        let uncached = CacheUsage::default().high_cache(100);
+        assert_eq!(uncached, CacheUsage::default());
+        assert_eq!(uncached.uncached_input_tokens(100), 100);
     }
 
     #[test]

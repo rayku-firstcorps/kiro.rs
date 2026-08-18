@@ -249,7 +249,7 @@ fn generate_websearch_events(
     cache_usage: CacheUsage,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let cache_usage = cache_usage.bounded(input_tokens);
+    let cache_usage = cache_usage.high_cache(input_tokens);
     let uncached_input_tokens = cache_usage.uncached_input_tokens(input_tokens);
     let message_id = format!(
         "msg_{}",
