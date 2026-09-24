@@ -79,22 +79,49 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
-            id: "claude-fable-5-1".to_string(),
+            id: "claude-fable-5".to_string(),
             object: "model".to_string(),
             created: 1790121600, // Sep 23, 2026
             owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5.1".to_string(),
+            display_name: "Claude Fable 5".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 128_000,
         },
         Model {
-            id: "claude-fable-5-1-thinking".to_string(),
+            id: "claude-fable-5-thinking".to_string(),
             object: "model".to_string(),
             created: 1790121600, // Sep 23, 2026
             owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5.1 (Thinking)".to_string(),
+            display_name: "Claude Fable 5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 128_000,
+        },
+        Model {
+            id: "gpt-5.6-sol".to_string(),
+            object: "model".to_string(),
+            created: 1783987200, // Jul 14, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Sol".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64_000,
+        },
+        Model {
+            id: "gpt-5.6-terra".to_string(),
+            object: "model".to_string(),
+            created: 1783987200, // Jul 14, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Terra".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64_000,
+        },
+        Model {
+            id: "gpt-5.6-luna".to_string(),
+            object: "model".to_string(),
+            created: 1783987200, // Jul 14, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Luna".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64_000,
         },
         Model {
             id: "claude-opus-5".to_string(),
@@ -129,6 +156,24 @@ pub async fn get_models() -> impl IntoResponse {
             created: 1782777600, // Jun 30, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-sonnet-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1785542400, // Aug 1, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-sonnet-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1785542400, // Aug 1, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.8 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 128_000,
         },
@@ -743,7 +788,7 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6、Sonnet 5、Opus 5、Fable 5.1：覆写为 adaptive 类型
+/// - Opus 4.6、Sonnet 5、Opus 5、Fable 5：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {

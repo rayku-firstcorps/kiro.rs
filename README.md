@@ -41,7 +41,7 @@
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: 支持 Fable、Sonnet、Opus、Haiku 系列模型
+- **多模型支持**: 支持 Fable、Sonnet、Opus、Haiku，以及 GPT-5.6 Sol / Terra / Luna
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
@@ -435,10 +435,12 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
+| 客户端模型 | Kiro 模型 |
 |----------------|-----------|
-| `*fable*`（含 5.1/5-1） | `claude-fable-5.1` |
+| `*fable*`（含 5、5.1、5-1） | `claude-fable-5` |
+| `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` | 原样透传（272K 上下文） |
 | `*sonnet-5*` | `claude-sonnet-5` |
+| `*sonnet*`（含 4.8/4-8） | `claude-sonnet-4.8` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
 | `*opus-5*` | `claude-opus-5` |

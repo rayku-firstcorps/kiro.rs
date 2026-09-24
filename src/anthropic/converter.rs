@@ -96,16 +96,25 @@ Complete all chunked operations without commentary.";
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
+    // Kiro 的 GPT-5.6 模型 ID 原样透传；-thinking 只用于本代理开启思考，不发给上游。
+    let without_thinking = model_lower
+        .strip_suffix("-thinking")
+        .unwrap_or(model_lower.as_str());
+    if matches!(
+        without_thinking,
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    ) {
+        return Some(without_thinking.to_string());
+    }
 
     if model_lower.contains("fable") {
-        if model_lower.contains("5-1") || model_lower.contains("5.1") {
-            Some("claude-fable-5.1".to_string())
-        } else {
-            None
-        }
+        // 上游模型 ID 是 claude-fable-5。发给 claude-fable-5.1 会返回 INVALID_MODEL_ID。
+        Some("claude-fable-5".to_string())
     } else if model_lower.contains("sonnet") {
         if model_lower.contains("sonnet-5") {
             Some("claude-sonnet-5".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            Some("claude-sonnet-4.8".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
@@ -138,14 +147,17 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / Fable 5.1 同 1M
+/// Sonnet 4.8 / Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / Fable 5 同 1M。
+/// GPT-5.6 家族在 Kiro 上是 272K。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
+        Some(mapped) if mapped.starts_with("gpt-5.") => 272_000,
         Some(mapped)
-            if mapped == "claude-fable-5.1"
+            if mapped == "claude-fable-5"
                 || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-5"
                 || mapped == "claude-sonnet-4.6"
+                || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -945,25 +957,22 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
         );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        // 没有明确次版本的旧日期 ID 不猜测上游模型。
+        assert!(map_model("claude-sonnet-4-20250514").is_none());
+        assert!(map_model("claude-3-5-sonnet-20241022").is_none());
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
         );
+        assert!(map_model("claude-opus-4-20250514").is_none());
     }
 
     #[test]
@@ -1033,21 +1042,56 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_fable_5_1() {
+    fn test_map_model_fable_5() {
+        assert_eq!(
+            map_model("claude-fable-5"),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5-thinking"),
+            Some("claude-fable-5".to_string())
+        );
+        // 5.1 别名仍落到 Kiro 接受的 claude-fable-5，避免 INVALID_MODEL_ID。
         assert_eq!(
             map_model("claude-fable-5-1"),
-            Some("claude-fable-5.1".to_string())
+            Some("claude-fable-5".to_string())
         );
         assert_eq!(
             map_model("claude-fable-5.1"),
-            Some("claude-fable-5.1".to_string())
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-fable-5-1"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_sonnet_4_8() {
+        assert_eq!(
+            map_model("claude-sonnet-4-8"),
+            Some("claude-sonnet-4.8".to_string())
         );
         assert_eq!(
-            map_model("claude-fable-5-1-thinking"),
-            Some("claude-fable-5.1".to_string())
+            map_model("claude-sonnet-4.8-thinking"),
+            Some("claude-sonnet-4.8".to_string())
         );
-        assert_eq!(get_context_window_size("claude-fable-5-1"), 1_000_000);
-        assert!(map_model("claude-fable-5").is_none());
+        assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_gpt_5_6_family() {
+        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(
+            map_model("gpt-5.6-terra"),
+            Some("gpt-5.6-terra".to_string())
+        );
+        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
+        assert_eq!(
+            map_model("gpt-5.6-sol-thinking"),
+            Some("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 272_000);
+        assert!(map_model("gpt-4").is_none());
     }
 
     #[test]
